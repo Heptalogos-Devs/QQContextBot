@@ -4,6 +4,7 @@ import asyncio
 import base64
 import json
 import logging
+import urllib.parse
 from datetime import datetime
 from pathlib import Path
 
@@ -143,24 +144,32 @@ async def _attach_video_content(
     user_msg = messages[1]
     assert isinstance(user_msg["content"], list)
 
+    # file_url from NapCat may be a local path (URL-encoded Windows path).
+    # Try it as both the explicit file_path and as a fallback for video_url.
+    local_candidates: list[str] = []
     if video_file_path:
-        try:
-            data = await asyncio.to_thread(Path(video_file_path).read_bytes)
-        except Exception as exc:
-            logger.warning(
-                "video: failed to read local file %s: %s", video_file_path, exc
-            )
-            return VideoAnalysis(error_code="video_read_error")
-        video_b64 = base64.b64encode(data).decode("ascii")
-        user_msg["content"].append(
-            {
-                "type": "video_url",
-                "video_url": {"url": f"data:video/mp4;base64,{video_b64}"},
-            }
-        )
-        return None
+        local_candidates.append(video_file_path)
+    if video_url and not video_url.startswith(("http://", "https://")):
+        local_candidates.append(urllib.parse.unquote(video_url))
 
-    if video_url:
+    for path in local_candidates:
+        try:
+            data = await asyncio.to_thread(Path(path).read_bytes)
+            video_b64 = base64.b64encode(data).decode("ascii")
+            user_msg["content"].append(
+                {
+                    "type": "video_url",
+                    "video_url": {"url": f"data:video/mp4;base64,{video_b64}"},
+                }
+            )
+            return None
+        except Exception:
+            continue
+
+    # Only forward genuine HTTP(S) URLs to the model; otherwise the provider
+    # will reject the request (e.g. status=400) and the failure looks like a
+    # vision error instead of a missing-bytes problem.
+    if video_url and video_url.startswith(("http://", "https://")):
         user_msg["content"].append(
             {
                 "type": "video_url",

@@ -192,7 +192,7 @@ def test_load_tool_guide_tool_returns_full_guidance_for_one_tool():
 
         assert result.status == "ok"
         assert result.data["tool_name"] == "terminate"
-        assert "静默结束本轮 Agent" in result.data["summary"]
+        assert "结束本次对话" in result.data["summary"]
         assert any("不会发送任何消息" in item for item in result.data["boundaries"])
         assert result.data["policy"]["full_exposure"] is True
         assert result.data["policy"]["counts_against_budget"] is False

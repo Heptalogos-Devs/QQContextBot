@@ -181,7 +181,9 @@ def test_read_video_resolves_message_id_before_extracting_sources(monkeypatch):
 
         assert result.status == "ok"
         assert captured["message_id"] == "old-video"
-        assert captured["local_path"] == "/tmp/old.mp4"
+        # /tmp/old.mp4 does not exist on disk and is not a NapCat file code,
+        # so _resolve_video_paths clears it.  The HTTP URL is still passed.
+        assert captured["local_path"] == ""
         assert captured["url"] == "https://example.test/old.mp4"
         assert captured["chat_context"] == "旧视频消息"
         assert captured["title"] == "old title"
@@ -648,5 +650,93 @@ def test_read_video_success_does_not_roll_back_quota(monkeypatch):
         assert result.status == "ok"
         assert quota.video_calls == [("20002", "30001")]
         assert quota.video_rollbacks == []
+
+    asyncio.run(_run())
+
+
+def test_read_video_falls_back_to_napcat_get_file(tmp_path, monkeypatch):
+    """Mirrors the recorder's NapCat fallback: when both candidate paths are
+    missing locally, ask ``api.qq.get_file`` to materialize the file and pass
+    the resolved local path to ``analyze_video``."""
+
+    async def _run():
+        resolved = tmp_path / "resolved.mp4"
+        resolved.write_bytes(b"video-bytes")
+
+        get_file_calls: list[str] = []
+
+        class _GetFileResult:
+            def __init__(self, file: str) -> None:
+                self.file = file
+                self.url = ""
+
+        class _Query:
+            @staticmethod
+            async def get_file(file_id: str):
+                get_file_calls.append(file_id)
+                return _GetFileResult(file=str(resolved))
+
+        class _QQ:
+            query = _Query()
+
+        plugin = SimpleNamespace(
+            _vision_client=object(),
+            _vision_quota=None,
+            _bridge=None,
+            settings=_settings(),
+            api=SimpleNamespace(qq=_QQ()),
+        )
+        message = SimpleNamespace(
+            id=42,
+            user_id="20002",
+            group_id="30001",
+            raw_message="视频消息",
+            videos=[],
+            segments=[
+                SimpleNamespace(
+                    segment_type="video",
+                    segment_data=json.dumps(
+                        {
+                            "file": "deadbeef0123456789.mp4",
+                            "url": (
+                                "C:/Users/test/Tencent/Video/Ori/deadbeef0123456789.mp4"
+                            ),
+                        }
+                    ),
+                )
+            ],
+        )
+        captured: dict = {}
+
+        async def _analyze_video(
+            client,
+            local_path,
+            url,
+            file_unique,
+            settings,
+            *,
+            chat_context,
+            title,
+            intro,
+        ):
+            del client, file_unique, settings, chat_context, title, intro
+            captured["local_path"] = local_path
+            captured["url"] = url
+            return VideoAnalysis(video_type="clip", confidence=0.9)
+
+        async def _persist_analysis(*args, **kwargs):
+            del args, kwargs
+
+        monkeypatch.setattr(media_tools, "analyze_video", _analyze_video)
+        monkeypatch.setattr(media_tools, "_persist_analysis", _persist_analysis)
+
+        result = await _media_tool(plugin, "read_video").handler(
+            {"source_msg": message, "user_id": "20002", "chat_id": "30001"},
+            {},
+        )
+
+        assert result.status == "ok"
+        assert get_file_calls == ["deadbeef0123456789.mp4"]
+        assert captured["local_path"] == str(resolved)
 
     asyncio.run(_run())

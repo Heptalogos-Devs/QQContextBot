@@ -169,7 +169,7 @@ def _apply_message_query_filters(
         (Message.has_app_share, has_app_share),
     ):
         if value is not None:
-            stmt = stmt.where(column == value)
+            stmt = stmt.where(column.is_(value))
     return stmt
 
 
@@ -535,6 +535,30 @@ class MessageStorage:
             stmt = stmt.limit(limit)
             result = await session.execute(stmt)
             return list(result.scalars().all())
+
+    async def backfill_forward_messages(
+        self,
+        message_db_id: int,
+        forward_messages: list[dict],
+    ) -> None:
+        """Replace forward content for a message that was already stored."""
+        async with self._session() as session:
+            message = await session.get(Message, message_db_id)
+            if message is None:
+                return
+            existing_stmt = select(ForwardMessage).where(
+                ForwardMessage.message_id == message_db_id
+            )
+            existing = await session.execute(existing_stmt)
+            for row in existing.scalars().all():
+                await session.delete(row)
+
+            if forward_messages:
+                await _add_forward_messages(session, message_db_id, forward_messages)
+                message.has_forward = True
+            else:
+                message.has_forward = False
+            await session.commit()
 
     async def save_image(self, message_db_id: int, image_data: dict) -> Image:
         async def _save_once() -> Image:

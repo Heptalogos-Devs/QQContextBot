@@ -95,6 +95,9 @@ def test_message_processor_persists_forward_messages_from_sender_content_shape(
                 "sender": {"nickname": "tester", "card": ""},
             }
         )
+        # Forward API backfill runs via ensure_future — yield to the event
+        # loop so it completes before we read the stored message.
+        await asyncio.sleep(0)
         stored = await storage.get_message("m-forward-1")
         await storage.close()
         return message_id, stored, logger

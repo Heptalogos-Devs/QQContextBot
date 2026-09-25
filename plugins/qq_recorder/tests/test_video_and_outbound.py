@@ -254,3 +254,113 @@ def test_outbound_group_send_is_recorded_and_reply_chain_can_reach_it(tmp_path):
     assert len(chain) == 2
     assert chain[0].message_id == "user-reply-1"
     assert "bot says hello" in chain[1].raw_message
+
+
+def test_message_processor_uses_napcat_get_file_when_local_path_missing(
+    tmp_path, monkeypatch
+):
+    """When NapCat's segment carries a bare file code but no live file, the
+    recorder should ask NapCat (via `get_file`) to materialize the video and
+    then ingest the resolved local path."""
+
+    async def _run():
+        db_path = tmp_path / "recorder.db"
+        videos_dir = tmp_path / "videos"
+        videos_dir.mkdir()
+
+        # Simulate the file NapCat creates only after we ask for it.
+        resolved_file = tmp_path / "napcat_resolved.mp4"
+        resolved_file.write_bytes(b"video-bytes-from-napcat")
+
+        settings = build_config(
+            {
+                "monitor_all": True,
+                "storage": {
+                    "database": str(db_path),
+                    "videos_dir": str(videos_dir),
+                },
+                "image": {"download": False},
+                "video": {
+                    "download": True,
+                    "timeout": 5,
+                    "max_file_size": 10_000_000,
+                    "max_duration_sec": 120,
+                },
+                "backup": {"enabled": False},
+            }
+        )
+        storage = MessageStorage(str(db_path))
+        await storage.init_db()
+
+        get_file_calls: list[str] = []
+
+        class _GetFileResult:
+            def __init__(self, file: str, url: str = "") -> None:
+                self.file = file
+                self.url = url
+
+        class _NapcatAPI:
+            class qq:
+                class query:
+                    @staticmethod
+                    async def get_forward_msg(_forward_id: str) -> dict:
+                        return {"messages": []}
+
+                @staticmethod
+                async def get_file(file_id: str):
+                    get_file_calls.append(file_id)
+                    return _GetFileResult(file=str(resolved_file))
+
+        async def _fail_download(*_args, **_kwargs):
+            raise AssertionError(
+                "HTTP download should not run when NapCat resolves the file"
+            )
+
+        monkeypatch.setattr(
+            "plugins.qq_recorder.video_handler.download_video",
+            _fail_download,
+        )
+
+        processor = MessageProcessor(storage, settings, _NapcatAPI(), _DummyLogger())
+
+        message_id = await processor.process_message(
+            {
+                "message_type": "group",
+                "message_id": "m-video-napcat",
+                "user_id": "u1",
+                "group_id": "g1",
+                "time": 1_712_345_678,
+                "raw_message": (
+                    "[CQ:video,file=deadbeef0123456789.mp4,"
+                    "url=C:/Users/test/Tencent/Video/Ori/deadbeef0123456789.mp4]"
+                ),
+                "message": [
+                    {
+                        "type": "video",
+                        "data": {
+                            "file": "deadbeef0123456789.mp4",
+                            # NapCat's placeholder local path; the QQ client has
+                            # not actually downloaded the file there yet.
+                            "url": (
+                                "C:/Users/test/Tencent/Video/Ori/deadbeef0123456789.mp4"
+                            ),
+                            "file_size": len(b"video-bytes-from-napcat"),
+                        },
+                    }
+                ],
+                "sender": {"nickname": "tester", "card": ""},
+            }
+        )
+        stored = await storage.get_message("m-video-napcat")
+        await storage.close()
+        return message_id, stored, get_file_calls
+
+    message_id, stored, get_file_calls = asyncio.run(_run())
+
+    assert message_id is not None
+    assert get_file_calls == ["deadbeef0123456789.mp4"]
+    assert stored is not None
+    assert len(stored.videos) == 1
+    assert stored.videos[0].downloaded is True
+    assert stored.videos[0].local_path
+    assert Path(stored.videos[0].local_path).exists()

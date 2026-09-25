@@ -138,7 +138,9 @@ def _optional_bool(arguments: dict[str, Any], key: str) -> bool | None:
     if key not in arguments:
         return None
     value = arguments.get(key)
-    return value if isinstance(value, bool) else None
+    if isinstance(value, bool):
+        return value
+    return None if value is None else None
 
 
 def _has_effective_filters(arguments: dict[str, Any]) -> bool:

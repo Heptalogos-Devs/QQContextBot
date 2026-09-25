@@ -4,11 +4,13 @@ import asyncio
 import base64
 import hashlib
 import json
+import os
 from pathlib import Path
 from typing import Any
 
 import aiohttp
 
+from ..compat import import_sibling_plugin_module
 from ..infra import get_analysis, save_analysis
 from ..shared import load_schema
 from ..vision.analyzer import analyze_image
@@ -17,6 +19,11 @@ from ..vision.schemas import analysis_to_dict, render_visual_context
 from ..vision.video_analyzer import analyze_video
 from ..vision.video_schemas import render_video_context, video_analysis_to_dict
 from .registry import ToolDefinition, ToolResponse
+
+_recorder_video_handler = import_sibling_plugin_module("qq_recorder.video_handler")
+decode_local_path = _recorder_video_handler.decode_local_path
+looks_like_napcat_file_code = _recorder_video_handler.looks_like_napcat_file_code
+resolve_via_napcat = _recorder_video_handler.resolve_via_napcat
 
 
 def build_media_tools(plugin) -> list[ToolDefinition]:
@@ -156,63 +163,35 @@ def _read_video_handler(plugin):
         context: dict[str, Any],
         arguments: dict[str, Any],
     ) -> ToolResponse:
-        if plugin._vision_client is None:
-            return ToolResponse(
-                status="failed",
-                data={},
-                error_code="vision_unavailable",
-                message="vision client not configured",
-            )
-        message = await _resolve_message(plugin, context, arguments)
-        if message is None:
-            return ToolResponse(
-                status="failed",
-                data={},
-                error_code="message_not_found",
-                message="message not available",
-                retryable=False,
-            )
-        source_msg = context.get("source_msg")
-        event = context.get("event") if message is source_msg else None
-        videos = _extract_video_sources(event, message)
-        if not videos:
-            return ToolResponse(
-                status="failed",
-                data={},
-                error_code="video_not_found",
-                message="no video source available",
-            )
-        video = videos[0]
-        file_unique = hashlib.sha1(
-            f"{video['url']}|{video['local_path']}".encode()
-        ).hexdigest()
-        model_used = plugin.settings.vision.video_summary_model
+        prep = await _prepare_read_video(plugin, context, arguments)
+        if isinstance(prep, ToolResponse):
+            return prep
+        message, video, file_unique, model_used, quota, user_id, chat_id = prep
 
-        cached = await get_analysis(plugin._bridge, file_unique, model_used=model_used)
-        if cached:
-            payload = json.loads(cached)
-            _log_cache_event(
-                plugin,
-                media_type="video",
-                file_unique=file_unique,
-                model_used=model_used,
-                cache_hit=True,
-                semantic_text=payload.get("semantic_text", ""),
+        # Normalize local_path / url from NapCat segments.
+        v_local = video["local_path"] or ""
+        v_url = video["url"] or ""
+        v_local, v_url = await _resolve_video_paths(plugin, v_local, v_url)
+        if not v_local and not v_url:
+            # NapCat could not materialize the video and there is no usable
+            # remote URL.  Refund the quota and surface a clear failure so the
+            # model does not blame the vision API.
+            if quota is not None and user_id is not None:
+                quota.rollback_video(user_id, chat_id or "unknown_chat")
+            return ToolResponse(
+                status="failed",
+                data={},
+                error_code="video_unreachable",
+                message=(
+                    "video bytes not available: NapCat get_file did not return"
+                    " a downloaded path and no HTTP URL is published"
+                ),
             )
-            return ToolResponse(status="ok", data=payload)
-
-        quota = getattr(plugin, "_vision_quota", None)
-        user_id: str | None = None
-        chat_id: str | None = None
-        if quota is not None:
-            user_id, chat_id = _quota_identity(context, message)
-            if not quota.check_and_consume_video(user_id, chat_id):
-                return _quota_failed("video")
 
         analysis = await analyze_video(
             plugin._vision_client,
-            video["local_path"],
-            video["url"],
+            v_local,
+            v_url,
             file_unique,
             plugin.settings,
             chat_context=str(getattr(message, "raw_message", "") or ""),
@@ -249,6 +228,83 @@ def _read_video_handler(plugin):
         )
 
     return _handler
+
+
+async def _prepare_read_video(
+    plugin,
+    context: dict[str, Any],
+    arguments: dict[str, Any],
+) -> (
+    ToolResponse
+    | tuple[
+        Any,
+        dict[str, Any],
+        str,
+        str,
+        Any,
+        str | None,
+        str | None,
+    ]
+):
+    """Run the precondition checks for ``read_video``.
+
+    Returns either a :class:`ToolResponse` (short-circuit failure) or a tuple
+    ``(message, video, file_unique, model_used, quota, user_id, chat_id)``
+    ready for the main vision call.
+    """
+    if plugin._vision_client is None:
+        return ToolResponse(
+            status="failed",
+            data={},
+            error_code="vision_unavailable",
+            message="vision client not configured",
+        )
+    message = await _resolve_message(plugin, context, arguments)
+    if message is None:
+        return ToolResponse(
+            status="failed",
+            data={},
+            error_code="message_not_found",
+            message="message not available",
+            retryable=False,
+        )
+    source_msg = context.get("source_msg")
+    event = context.get("event") if message is source_msg else None
+    videos = _extract_video_sources(event, message)
+    if not videos:
+        return ToolResponse(
+            status="failed",
+            data={},
+            error_code="video_not_found",
+            message="no video source available",
+        )
+    video = videos[0]
+    file_unique = hashlib.sha1(
+        f"{video['url']}|{video['local_path']}".encode()
+    ).hexdigest()
+    model_used = plugin.settings.vision.video_summary_model
+
+    cached = await get_analysis(plugin._bridge, file_unique, model_used=model_used)
+    if cached:
+        payload = json.loads(cached)
+        _log_cache_event(
+            plugin,
+            media_type="video",
+            file_unique=file_unique,
+            model_used=model_used,
+            cache_hit=True,
+            semantic_text=payload.get("semantic_text", ""),
+        )
+        return ToolResponse(status="ok", data=payload)
+
+    quota = getattr(plugin, "_vision_quota", None)
+    user_id: str | None = None
+    chat_id: str | None = None
+    if quota is not None:
+        user_id, chat_id = _quota_identity(context, message)
+        if not quota.check_and_consume_video(user_id, chat_id):
+            return _quota_failed("video")
+    return message, video, file_unique, model_used, quota, user_id, chat_id
 
 
 async def _resolve_message(plugin, context: dict[str, Any], arguments: dict[str, Any]):
@@ -295,6 +351,56 @@ def _extract_video_from_stored(video) -> dict[str, Any]:
         "title": _clean_string(getattr(video, "title", None)) or "",
         "intro": _clean_string(getattr(video, "intro", None)) or "",
     }
+
+
+async def _resolve_video_paths(plugin, v_local: str, v_url: str) -> tuple[str, str]:
+    """Mirror the recorder's NapCat fallback for grok's read_video.
+
+    NapCat ``getVideoUrl`` sometimes returns a placeholder local path under
+    ``Documents/Tencent Files/.../Video/.../Ori`` that points at a file the QQ
+    client has not actually downloaded yet.  The recorder asks NapCat to
+    materialize the file via the OB11 ``get_file`` action and uses the resolved
+    path.  Grok reuses the same fallback so vision can read the video bytes.
+
+    Returned tuple semantics:
+      - ``v_local`` is non-empty only when it points at an existing on-disk file
+        that ``analyze_video`` can read.
+      - ``v_url`` is non-empty only when it is a usable HTTP(S) URL that the
+            vision API can fetch directly.  Bare filesystem paths or ``file://``
+            URIs are filtered out so they never leak into ``video_url``.
+    """
+    decoded_local = decode_local_path(v_local) if v_local else ""
+    if decoded_local and os.path.isfile(decoded_local):
+        return decoded_local, _sanitize_remote_url(v_url)
+
+    decoded_url = decode_local_path(v_url) if v_url else ""
+    if decoded_url and os.path.isfile(decoded_url):
+        return decoded_url, _sanitize_remote_url(v_url)
+
+    api = getattr(plugin, "api", None)
+    file_code = v_local if looks_like_napcat_file_code(v_local) else ""
+    if api is None or not file_code:
+        return "", _sanitize_remote_url(v_url)
+
+    resolved_path, resolved_url = await resolve_via_napcat(api, file_code)
+    if resolved_path and os.path.isfile(resolved_path):
+        return resolved_path, _sanitize_remote_url(resolved_url or v_url)
+    return "", _sanitize_remote_url(resolved_url or v_url)
+
+
+def _sanitize_remote_url(url: str) -> str:
+    """Only forward HTTP(S) URLs to the vision API.
+
+    NapCat frequently passes a local Windows path (or ``file://`` URI) through
+    the OneBot ``url`` field when ``getVideoUrl`` fails.  Letting that reach the
+    OpenAI-compatible video endpoint produces a misleading ``status=400`` from
+    the model provider; treat it as "no remote URL" instead.
+    """
+    if not url:
+        return ""
+    if url.startswith(("http://", "https://")):
+        return url
+    return ""
 
 
 def _extract_video_from_event_segment(segment) -> dict[str, Any] | None:
